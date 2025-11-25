@@ -95,3 +95,184 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import gzip
+import json
+import pickle
+import pandas as pd
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    confusion_matrix
+)
+
+# ==============================================================
+# 1. Cargar datos
+# ==============================================================
+
+# Importo test y train
+test_data = pd.read_csv("files/input/test_data.csv.zip", compression="zip")
+train_data = pd.read_csv("files/input/train_data.csv.zip", compression="zip")
+
+# Renombrar columna objetivo
+test_data = test_data.rename(columns={'default payment next month': 'default'})
+train_data = train_data.rename(columns={'default payment next month': 'default'})
+
+# Eliminar columna ID
+test_data = test_data.drop(columns=['ID'])
+train_data = train_data.drop(columns=['ID'])
+
+# Limpiar valores de EDUCATION y MARRIAGE
+train_data = train_data.loc[train_data["MARRIAGE"] != 0]
+train_data = train_data.loc[train_data["EDUCATION"] != 0]
+test_data = test_data.loc[test_data["MARRIAGE"] != 0]
+test_data = test_data.loc[test_data["EDUCATION"] != 0]
+
+# Valores > 4 en EDUCATION se agrupan como 4
+train_data["EDUCATION"] = train_data["EDUCATION"].apply(lambda x: 4 if x > 4 else x)
+test_data["EDUCATION"] = test_data["EDUCATION"].apply(lambda x: 4 if x > 4 else x)
+
+# Dividir en X y y
+x_train = train_data.drop(columns="default")
+y_train = train_data["default"]
+x_test = test_data.drop(columns="default")
+y_test = test_data["default"]
+
+# ==============================================================
+# 2. Crear pipeline
+# ==============================================================
+
+categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+numerical_features = [col for col in x_train.columns if col not in categorical_features]
+
+# Preprocesamiento
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("categorical", OneHotEncoder(), categorical_features),
+        ("scaler", StandardScaler(), numerical_features),
+    ]
+)
+
+pipeline = Pipeline(
+    steps=[
+        ("preprocessor", preprocessor),
+        ("pca", PCA()),
+        ("feature_selection", SelectKBest(score_func=f_classif)),
+        ("classifier", SVC(random_state=42)),
+    ]
+)
+
+# ==============================================================
+# 3. Configurar GridSearchCV
+# ==============================================================
+
+param_grid = {
+    "pca__n_components": [20, x_train.shape[1] - 2],
+    "feature_selection__k": [12],
+    "classifier__kernel": ["rbf"],
+    "classifier__gamma": [0.1],
+}
+
+model = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    cv=10,
+    scoring="balanced_accuracy",
+    n_jobs=-1,
+    refit=True,
+)
+
+# Entrenar modelo
+model.fit(x_train, y_train)
+
+# ==============================================================
+# 4. Guardar modelo (GridSearchCV completo)
+# ==============================================================
+
+os.makedirs("files/models", exist_ok=True)
+model_path = "files/models/model.pkl.gz"
+
+with gzip.open(model_path, "wb") as file:
+    pickle.dump(model, file)
+
+# ==============================================================
+# 5. Calcular métricas y guardar
+# ==============================================================
+
+def calculate_and_save_metrics(model, X_train, X_test, y_train, y_test):
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+
+    metrics_train = {
+        "type": "metrics",
+        "dataset": "train",
+        "precision": precision_score(y_train, y_train_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_train, y_train_pred),
+        "recall": recall_score(y_train, y_train_pred, zero_division=0),
+        "f1_score": f1_score(y_train, y_train_pred, zero_division=0),
+    }
+
+    metrics_test = {
+        "type": "metrics",
+        "dataset": "test",
+        "precision": precision_score(y_test, y_test_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_test, y_test_pred),
+        "recall": recall_score(y_test, y_test_pred, zero_division=0),
+        "f1_score": f1_score(y_test, y_test_pred, zero_division=0),
+    }
+
+    os.makedirs("files/output", exist_ok=True)
+    output_path = "files/output/metrics.json"
+
+    with open(output_path, "w") as f:
+        f.write(json.dumps(metrics_train) + "\n")
+        f.write(json.dumps(metrics_test) + "\n")
+
+
+# ==============================================================
+# 6. Calcular matrices de confusión y guardar
+# ==============================================================
+
+def calculate_and_save_confusion_matrices(model, X_train, X_test, y_train, y_test):
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+
+    cm_train = confusion_matrix(y_train, y_train_pred)
+    cm_test = confusion_matrix(y_test, y_test_pred)
+
+    def format_cm(cm, dataset):
+        return {
+            "type": "cm_matrix",
+            "dataset": dataset,
+            "true_0": {
+                "predicted_0": int(cm[0, 0]),
+                "predicted_1": int(cm[0, 1]),
+            },
+            "true_1": {
+                "predicted_0": int(cm[1, 0]),
+                "predicted_1": int(cm[1, 1]),
+            },
+        }
+
+    output_path = "files/output/metrics.json"
+    with open(output_path, "a") as f:
+        f.write(json.dumps(format_cm(cm_train, "train")) + "\n")
+        f.write(json.dumps(format_cm(cm_test, "test")) + "\n")
+
+
+# ==============================================================
+# 7. Ejecutar funciones
+# ==============================================================
+
+calculate_and_save_metrics(model, x_train, x_test, y_train, y_test)
+calculate_and_save_confusion_matrices(model, x_train, x_test, y_train, y_test)
